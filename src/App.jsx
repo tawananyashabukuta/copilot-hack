@@ -178,7 +178,11 @@ function BookingForm({ initialProperty = "clandstein" }) {
         .eq("property_id", property)
         .lte("check_in", checkOut)
         .gte("check_out", checkIn),
-      fetchAllBookings().then((data) => ({ data, error: null })).catch((error) => ({ data: null, error })),
+      supabase.from("bookings")
+        .select("houseboat_name, check_in, check_out")
+        .eq("houseboat_name", stay.name)
+        .lte("check_in", checkOut)
+        .gte("check_out", checkIn),
     ]);
 
     if (blockedResult.error) console.warn("Blocked dates could not be checked:", blockedResult.error);
@@ -187,15 +191,8 @@ function BookingForm({ initialProperty = "clandstein" }) {
     if (rangeBlocksResult.error) console.warn("Availability blocks could not be checked:", rangeBlocksResult.error);
     else if (rangeBlocksResult.data.length > 0) return false;
 
-    if (bookingsResult.error) {
-      console.warn("Existing bookings could not be checked:", bookingsResult.error);
-    } else if (bookingsResult.data.some((row) => {
-      const booking = normalizeBooking(row);
-      return booking.status !== "cancelled"
-        && (!booking.property || booking.property === property)
-        && booking.check_in <= checkOut
-        && booking.check_out >= checkIn;
-    })) {
+    if (bookingsResult.error) console.warn("Existing bookings could not be checked:", bookingsResult.error);
+    else if (bookingsResult.data.length > 0) {
       return false;
     }
     return true;
@@ -661,6 +658,8 @@ function AdminPanel() {
   const [session, setSession] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [clearingBlocks, setClearingBlocks] = useState(false);
+  const [removingBlock, setRemovingBlock] = useState("");
   const [property, setProperty] = useState("clandstein");
   const [blockedFrom, setBlockedFrom] = useState(dateOffset(1));
   const [blockedTo, setBlockedTo] = useState(dateOffset(1));
@@ -844,14 +843,62 @@ function AdminPanel() {
 
   async function removeBlockedDate(date) {
     setError("");
-    const removeQuery = date.kind === "range"
-      ? supabase.from("availability_blocks").delete().eq("id", date.id)
-      : supabase.from("blocked_dates").delete().eq("property_id", date.property_id).eq("blocked_on", date.blocked_on);
-    const { error: removeError } = await removeQuery;
-    if (removeError) setError(removeError.message);
-    else setBlockedDates((dates) => dates.filter((item) => date.kind === "range"
-      ? item.kind !== "range" || item.id !== date.id
-      : item.kind !== "single" || item.property_id !== date.property_id || item.blocked_on !== date.blocked_on));
+    const blockKey = date.kind === "range" ? `range-${date.id}` : `single-${date.property_id}-${date.blocked_on}`;
+    setRemovingBlock(blockKey);
+    try {
+      const removeQuery = date.kind === "range"
+        ? supabase.from("availability_blocks").delete().eq("id", date.id).select("id")
+        : supabase.from("blocked_dates").delete()
+          .eq("property_id", date.property_id)
+          .eq("blocked_on", date.blocked_on)
+          .select("property_id, blocked_on");
+      const { data, error: removeError } = await removeQuery;
+      if (removeError) throw removeError;
+      if (!data?.length) {
+        throw new Error("The date was not removed. Check that you are signed in as an authorised admin and that the latest Supabase schema policies are applied.");
+      }
+      setBlockedDates((dates) => dates.filter((item) => date.kind === "range"
+        ? item.kind !== "range" || item.id !== date.id
+        : item.kind !== "single" || item.property_id !== date.property_id || item.blocked_on !== date.blocked_on));
+    } catch (removeError) {
+      setError(`Could not unblock this date: ${removeError.message || "request failed"}`);
+    } finally {
+      setRemovingBlock("");
+    }
+  }
+
+  async function removeAllBlockedDates() {
+    if (!window.confirm("Unblock every date for both accommodations?")) return;
+    setError("");
+    setClearingBlocks(true);
+    try {
+      const [rangesResult, datesResult] = await Promise.all([
+        supabase.from("availability_blocks").delete().not("id", "is", null).select("id"),
+        supabase.from("blocked_dates").delete().not("blocked_on", "is", null).select("property_id, blocked_on"),
+      ]);
+      if (rangesResult.error || datesResult.error) {
+        setError([
+          rangesResult.error && `Could not remove date ranges: ${rangesResult.error.message}`,
+          datesResult.error && `Could not remove blocked dates: ${datesResult.error.message}`,
+        ].filter(Boolean).join(" "));
+        setDataRefresh((count) => count + 1);
+        return;
+      }
+      const removedRangeIds = new Set((rangesResult.data || []).map((item) => item.id));
+      const removedDates = new Set((datesResult.data || []).map((item) => `${item.property_id}-${item.blocked_on}`));
+      setBlockedDates((dates) => dates.filter((item) => item.kind === "range"
+        ? !removedRangeIds.has(item.id)
+        : !removedDates.has(`${item.property_id}-${item.blocked_on}`)));
+      if (blockedDates.length > 0 && removedRangeIds.size + removedDates.size === 0) {
+        setError("No blocked dates were removed. Check admin delete permissions and the Supabase schema policies.");
+        setDataRefresh((count) => count + 1);
+      }
+    } catch (clearError) {
+      setError(`Could not unblock all dates: ${clearError.message || "request failed"}`);
+      setDataRefresh((count) => count + 1);
+    } finally {
+      setClearingBlocks(false);
+    }
   }
 
   async function signOut() {
@@ -886,14 +933,21 @@ function AdminPanel() {
               <button className="button button-primary" type="submit"><Plus size={16} /> Block date</button>
             </form>
             <div className="admin-list">
-              <h3>Blocked dates <span>{blockedDates.length}</span></h3>
+              <div className="admin-list-heading">
+                <h3>Blocked dates <span>{blockedDates.length}</span></h3>
+                <button className="unblock-all-button" type="button" disabled={loadingData || clearingBlocks || blockedDates.length === 0} onClick={removeAllBlockedDates}>
+                  {clearingBlocks ? "Unblocking…" : "Unblock all dates"}
+                </button>
+              </div>
               {loadingData ? <p className="empty-state">Loading dates…</p> : blockedDates.length === 0 ? <p className="empty-state">No dates blocked yet.</p> : blockedDates.map((date) => {
                 const start = date.check_in || date.blocked_on;
                 const end = date.check_out || date.blocked_on;
-                return <div className="admin-list-row" key={date.kind === "range" ? `range-${date.id}` : `single-${date.property_id}-${date.blocked_on}`}>
+                const blockKey = date.kind === "range" ? `range-${date.id}` : `single-${date.property_id}-${date.blocked_on}`;
+                const isRemoving = removingBlock === blockKey;
+                return <div className="admin-list-row" key={blockKey}>
                   <span><CalendarDays size={15} /> {prettyDate(start)}{end !== start && ` – ${prettyDate(end)}`}</span>
                   <small>{properties[date.property_id]?.name || date.property_id}</small>
-                  <button className="unblock-button" aria-label={`Unblock ${prettyDate(start)}${end !== start ? ` through ${prettyDate(end)}` : ""}`} onClick={() => removeBlockedDate(date)}><X size={16} /></button>
+                  <button className="unblock-button" type="button" disabled={isRemoving || clearingBlocks} aria-label={`Unblock ${prettyDate(start)}${end !== start ? ` through ${prettyDate(end)}` : ""}`} onClick={() => removeBlockedDate(date)}>{isRemoving ? <RefreshCw size={14} className="is-spinning" /> : <X size={14} />} {isRemoving ? "Removing…" : "Unblock"}</button>
                 </div>;
               })}
             </div>
