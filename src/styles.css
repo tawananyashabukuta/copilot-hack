@@ -345,6 +345,7 @@ h1, h2, p { margin-top: 0; }
 .booking-date-range { display: block; min-width: 106px; color: #475a4b; line-height: 1.45; white-space: nowrap; }
 .booking-date-range > span { color: #8b968b; font-size: 8px; }
 .block-form { display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 10px; margin-top: 18px; }
+.availability-block-form { grid-template-columns: minmax(0, 1.2fr) repeat(2, minmax(0, 1fr)) auto; }
 .block-form .button { min-height: 42px; white-space: nowrap; padding: 0 12px; font-size: 10px; }
 .block-form .field input, .block-form .field select { font-size: 10px; }
 .admin-list { margin-top: 19px; }
@@ -506,6 +507,7 @@ h1, h2, p { margin-top: 0; }
   .bookings-table td::before { content: attr(data-label); color: #859085; font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
   .booking-date-range { white-space: normal; }
   .block-form { grid-template-columns: 1fr 1fr; }
+  .availability-block-form { grid-template-columns: 1fr 1fr; }
   .block-form .button { grid-column: 1 / -1; }
   .admin-list-row { grid-template-columns: minmax(0, 1fr) auto; }
   .admin-list-row > small { grid-column: 1; grid-row: 2; padding-left: 22px; }

@@ -46,10 +46,6 @@ function whatsappLink(message) {
   return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(message)}`;
 }
 
-function whatsappChatLink() {
-  return `https://wa.me/${WHATSAPP_NUMBER}`;
-}
-
 function ownerBookingMessage({ name, phone, stayName, checkIn, checkOut, guests }) {
   return [
     "NEW UNILEISURE BOOKING",
@@ -65,50 +61,47 @@ function ownerBookingMessage({ name, phone, stayName, checkIn, checkOut, guests 
 
 async function fetchAllBookings() {
   const pageSize = 500;
-  const bookings = [];
+  const allBookings = [];
+
   for (let start = 0; ; start += pageSize) {
     const { data, error } = await supabase
       .from("bookings")
-      .select("*")
+      .select("id, houseboat_name, name, email, phone, guests, check_in, check_out, created_at")
       .order("created_at", { ascending: false })
       .range(start, start + pageSize - 1);
-    if (error) throw error;
-    bookings.push(...data);
-    if (data.length < pageSize) return bookings;
+    if (error) return { data: null, error };
+    allBookings.push(...data);
+    if (data.length < pageSize) return { data: allBookings, error: null };
   }
 }
 
-function normalizeBooking(row) {
-  const houseboatName = row.houseboat_name || "";
-  const storedProperty = row.property_id || row.property || "";
-  const property = storedProperty === "clandstein" || storedProperty === "coates"
-    ? storedProperty
-    : /clandstein|houseboat/i.test(houseboatName)
-      ? "clandstein"
-      : /coates|cottage/i.test(houseboatName) ? "coates" : "";
-  return {
-    ...row,
-    name: row.guest_name || row.name || "",
-    email: row.guest_email || row.email || "",
-    phone: row.guest_phone || row.phone || "",
-    property,
-    stayName: houseboatName || properties[property]?.name || "",
-    guests: row.guest_count ?? row.guests ?? null,
-    status: row.status || "requested",
-  };
-}
-
-async function insertBooking(row) {
-  const { error } = await supabase.from("bookings").insert({
-    houseboat_name: row.stayName,
-    name: row.name,
-    email: row.email,
-    phone: row.phone,
-    guests: row.guests,
-    check_in: row.check_in,
-    check_out: row.check_out,
+async function requestAvailability(property, checkIn, checkOut) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const { data, error } = await supabase.rpc("check_booking_availability", {
+    p_property_id: property,
+    p_check_in: checkIn,
+    p_check_out: checkOut,
   });
   if (error) throw error;
+  return data === true;
+}
+
+async function insertBooking({ name, email, phone, property, guests, checkIn, checkOut }) {
+  if (!supabase) throw new Error("Supabase is not configured. Please use Enquire on WhatsApp.");
+  const { data, error } = await supabase.rpc("create_booking", {
+    p_property_id: property,
+    p_guest_name: name,
+    p_guest_email: email,
+    p_guest_phone: phone,
+    p_guest_count: guests,
+    p_check_in: checkIn,
+    p_check_out: checkOut,
+  });
+  if (error) throw error;
+  if (typeof data !== "string" || !data) {
+    throw new Error("The database did not confirm that the booking was saved.");
+  }
+  return data;
 }
 
 function Brand({ light = false }) {
@@ -165,39 +158,6 @@ function BookingForm({ initialProperty = "clandstein" }) {
     return true;
   }
 
-  async function requestAvailability() {
-    if (!supabase) return true;
-    const [blockedResult, rangeBlocksResult, bookingsResult] = await Promise.all([
-      supabase.from("blocked_dates")
-        .select("property_id, blocked_on")
-        .eq("property_id", property)
-        .gte("blocked_on", checkIn)
-        .lte("blocked_on", checkOut),
-      supabase.from("availability_blocks")
-        .select("property_id, check_in, check_out")
-        .eq("property_id", property)
-        .lte("check_in", checkOut)
-        .gte("check_out", checkIn),
-      supabase.from("bookings")
-        .select("houseboat_name, check_in, check_out")
-        .eq("houseboat_name", stay.name)
-        .lte("check_in", checkOut)
-        .gte("check_out", checkIn),
-    ]);
-
-    if (blockedResult.error) console.warn("Blocked dates could not be checked:", blockedResult.error);
-    else if (blockedResult.data.length > 0) return false;
-
-    if (rangeBlocksResult.error) console.warn("Availability blocks could not be checked:", rangeBlocksResult.error);
-    else if (rangeBlocksResult.data.length > 0) return false;
-
-    if (bookingsResult.error) console.warn("Existing bookings could not be checked:", bookingsResult.error);
-    else if (bookingsResult.data.length > 0) {
-      return false;
-    }
-    return true;
-  }
-
   async function enquireOnWhatsApp(event) {
     if (!event.currentTarget.form.reportValidity() || !validateBooking()) return;
     const ownerLink = whatsappLink(ownerBookingMessage({
@@ -210,8 +170,7 @@ function BookingForm({ initialProperty = "clandstein" }) {
     }));
     setCheckingAvailability(true);
     try {
-      const isAvailable = await requestAvailability();
-      if (!isAvailable) {
+      if (!(await requestAvailability(property, checkIn, checkOut))) {
         setMessage("The following dates are booked. Please choose different dates or contact the owner.");
         return;
       }
@@ -227,6 +186,7 @@ function BookingForm({ initialProperty = "clandstein" }) {
     event.preventDefault();
     setBookingConfirmation(null);
     if (!validateBooking()) return;
+
     const booking = {
       name: name.trim(),
       phone: phone.trim(),
@@ -235,26 +195,23 @@ function BookingForm({ initialProperty = "clandstein" }) {
       checkOut,
       guests,
     };
-    const ownerMessage = ownerBookingMessage(booking);
-    const ownerLink = whatsappLink(ownerMessage);
+    const ownerLink = whatsappLink(ownerBookingMessage(booking));
     setBusy(true);
     try {
-      if (!(await requestAvailability())) {
+      if (!(await requestAvailability(property, checkIn, checkOut))) {
         setMessage("The following dates are booked. Please choose different dates or enquire on WhatsApp.");
         return;
       }
-      if (!supabase) throw new Error("Supabase is not configured. Please use Enquire on WhatsApp.");
-      await insertBooking({
+      const bookingId = await insertBooking({
         name: name.trim(),
         email: email.trim(),
         phone: phone.trim(),
         property,
-        stayName: stay.name,
         guests,
-        check_in: checkIn,
-        check_out: checkOut,
+        checkIn,
+        checkOut,
       });
-      setBookingConfirmation({ ...booking, bookingId: "Saved to booking records", ownerLink });
+      setBookingConfirmation({ ...booking, bookingId, ownerLink });
     } catch (error) {
       console.error("Booking request could not be saved:", error);
       setMessage(`${error.message || "We couldn't save your request."} Please try again or enquire on WhatsApp.`);
@@ -324,7 +281,7 @@ function BookingForm({ initialProperty = "clandstein" }) {
           <button className="button button-outline booking-whatsapp-button" type="button" disabled={checkingAvailability || busy} onClick={enquireOnWhatsApp}>
             <MessageCircle size={16} /> {checkingAvailability ? "Checking dates…" : "Enquire on WhatsApp"}
           </button>
-          <button className="button button-primary booking-submit" disabled={busy} type="submit">
+          <button className="button button-primary booking-submit" disabled={busy || checkingAvailability} type="submit">
             {busy ? "Saving…" : "Book"} <ArrowUpRight size={17} />
           </button>
         </div>
@@ -581,56 +538,33 @@ function CottageSection() {
   );
 }
 
-function answerFromStayInfo(question) {
-  const query = question.toLowerCase();
-  const mentionsBoat = /boat|kariba|clandstein|fishing|tender|cook/.test(query);
-  const mentionsCottage = /cottage|nyanga|connemara|world.?s view|mountain|braai|hot tub/.test(query);
-  const asksPrice = /price|rate|cost|how much|per night/.test(query);
-  const asksBooking = /book|booking|available|availability|dates|reserve/.test(query);
-  const asksLocation = /where|location|directions|far|near|located/.test(query);
-  const asksAmenities = /amenit|include|bedroom|bathroom|sleep|guest|kitchen|self.?cater/.test(query);
-  const whatsapp = "For availability and payment arrangements, contact our team on WhatsApp at +263 77 213 6751.";
-
-  if (asksBooking) {
-    return `You can enquire about either stay using the booking form on this page. ${whatsapp} There is no online payment.`;
-  }
-  if (asksPrice && (mentionsCottage || (!mentionsBoat && /cottage|nyanga/.test(query)))) {
-    return `Coates Cottage rates are confirmed by the owner. ${whatsapp}`;
-  }
-  if (asksPrice) {
-    return "CLANDSTEIN Houseboat has a dry rate of US$350 per night off-peak and US$550 per night peak, with a 3-night minimum stay. Please confirm dates and rates with the owner on WhatsApp at +263 77 213 6751.";
-  }
-  if (mentionsCottage || (/cottage|nyanga|connemara/.test(query))) {
-    return "Coates Cottage is in Connemara, Nyanga. It has 4 bedrooms, 3 bathrooms and sleeps up to 11 guests sharing. It is self-catering, with a fully equipped kitchen, open-plan lounge and dining area, outdoor braai, wood-fired hot tub and garden. It is close to Connemara Dam and scenic trails, and World's View is 1 km away.";
-  }
-  if (mentionsBoat || /boat|kariba|clandstein/.test(query)) {
-    return "CLANDSTEIN Houseboat is on Lake Kariba. It has 2 cabins and sleeps up to 6 guests. A cook and tender boat are included; the boat is self-catering. Minimum stay is 3 nights. It suits family holidays, fishing getaways, weekend escapes and corporate retreats.";
-  }
-  if (asksLocation) {
-    return "Our two stays are CLANDSTEIN Houseboat on Lake Kariba and Coates Cottage in Connemara, Nyanga. World's View is 1 km from the cottage.";
-  }
-  if (asksAmenities) {
-    return "CLANDSTEIN Houseboat sleeps up to 6 across 2 cabins, with a cook and tender boat included; it is self-catering. Coates Cottage sleeps up to 11 sharing, with 4 bedrooms, 3 bathrooms, a self-catering kitchen, lounge and dining area, outdoor braai, wood-fired hot tub and garden.";
-  }
-  return `I can help with our Lake Kariba houseboat, Coates Cottage in Nyanga, amenities, rates and booking enquiries. What would you like to know? ${whatsapp}`;
-}
-
 function Concierge() {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState([{ role: "assistant", content: "Hello! I’m your Stay at UniLeisure concierge. Ask me about our stays, amenities, rates or getting here." }]);
   const bottomRef = useRef(null);
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, open]);
+  useEffect(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), [messages, open]);
 
-  function sendMessage(text = input) {
+  async function sendMessage(text = input) {
     const question = text.trim();
-    if (!question) return;
+    if (!question || busy) return;
     const history = [...messages, { role: "user", content: question }];
     setMessages(history);
     setInput("");
-    setMessages([...history, { role: "assistant", content: answerFromStayInfo(question) }]);
+    setBusy(true);
+    try {
+      if (!supabase) throw new Error("Concierge is not configured yet.");
+      const { data, error } = await supabase.functions.invoke("concierge", {
+        body: { messages: history.slice(-8).map(({ role, content }) => ({ role, content })) },
+      });
+      if (error) throw error;
+      setMessages([...history, { role: "assistant", content: data.answer }]);
+    } catch {
+      setMessages([...history, { role: "assistant", content: "I’m having trouble connecting just now. Our team can help you directly on WhatsApp." }]);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -639,10 +573,11 @@ function Concierge() {
         <header className="chat-header"><div className="chat-avatar"><Sparkles size={18} /></div><div><strong>Your stay, sorted.</strong><small>Stay at UniLeisure concierge</small></div><button aria-label="Close chat" onClick={() => setOpen(false)}><X size={18} /></button></header>
         <div className="chat-messages">
           {messages.map((item, index) => <div key={`${item.role}-${index}`} className={`chat-message ${item.role}`}>{item.content}</div>)}
+          {busy && <div className="chat-message assistant typing">Finding the right details…</div>}
           <div ref={bottomRef} />
         </div>
         {messages.length === 1 && <div className="chat-prompts">{["Tell me about Nyanga", "Houseboat rates", "What’s included?"].map((prompt) => <button key={prompt} onClick={() => sendMessage(prompt)}>{prompt}</button>)}</div>}
-        <form className="chat-input" onSubmit={(event) => { event.preventDefault(); sendMessage(); }}><input aria-label="Ask a question" value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask us anything…" maxLength={500} /><button aria-label="Send message" disabled={!input.trim()}><Send size={17} /></button></form>
+        <form className="chat-input" onSubmit={(event) => { event.preventDefault(); sendMessage(); }}><input aria-label="Ask a question" value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask us anything…" maxLength={500} /><button aria-label="Send message" disabled={busy || !input.trim()}><Send size={17} /></button></form>
         <a className="chat-whatsapp" href={whatsappLink("Hello! I have a question about staying with UniLeisure.")} target="_blank" rel="noreferrer"><MessageCircle size={14} /> Prefer WhatsApp? Chat to our team</a>
       </section>}
       <button className={`chat-launcher${open ? " is-open" : ""}`} aria-label={open ? "Close concierge chat" : "Open concierge chat"} onClick={() => setOpen(!open)}>
@@ -658,38 +593,34 @@ function AdminPanel() {
   const [session, setSession] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [clearingBlocks, setClearingBlocks] = useState(false);
-  const [removingBlock, setRemovingBlock] = useState("");
   const [property, setProperty] = useState("clandstein");
+  const [blockedOn, setBlockedOn] = useState(dateOffset(1));
   const [blockedFrom, setBlockedFrom] = useState(dateOffset(1));
   const [blockedTo, setBlockedTo] = useState(dateOffset(1));
   const [blockedDates, setBlockedDates] = useState([]);
+  const [availabilityBlocks, setAvailabilityBlocks] = useState([]);
   const [bookings, setBookings] = useState([]);
   const [bookingsError, setBookingsError] = useState("");
   const [loadingData, setLoadingData] = useState(false);
   const [dataRefresh, setDataRefresh] = useState(0);
 
   useEffect(() => {
-    if (!supabase) {
-      setError("Admin sign-in is not configured. Add the Supabase project URL and public key.");
-      return undefined;
-    }
+    if (!supabase) return undefined;
     let cancelled = false;
-    supabase.auth.getSession().then(({ data, error: sessionError }) => {
-      if (cancelled) return;
-      if (sessionError) setError(sessionError.message);
-      const currentSession = data.session;
-      const allowed = ADMIN_EMAILS.includes(normalizeEmail(currentSession?.user?.email));
-      if (allowed) setSession(currentSession);
-      else if (currentSession) void supabase.auth.signOut();
+    supabase.auth.getSession().then(({ data }) => {
+  if (cancelled) return;
+  const email = normalizeEmail(data.session?.user?.email);
+  if (data.session && ADMIN_EMAILS.map(normalizeEmail).includes(email)) {
+    setSession(data.session);
+  } else if (data.session) {
+    // supabase.auth.signOut();
+  }
     }).catch((sessionError) => {
-      if (!cancelled) setError(sessionError.message || "Could not check admin sign-in.");
+      if (!cancelled) setError(sessionError.message || "Could not connect to admin sign-in. Check the Supabase project URL and try again.");
     });
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      const allowed = ADMIN_EMAILS.includes(normalizeEmail(newSession?.user?.email));
-      setSession(allowed ? newSession : null);
-    });
-    return () => {
+   const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
+  setSession(newSession);
+});    return () => {
       cancelled = true;
       subscription.unsubscribe();
     };
@@ -703,38 +634,31 @@ function AdminPanel() {
       setError("");
       setBookingsError("");
       try {
-        const [singleDatesResult, rangeBlocksResult, bookingResult] = await Promise.all([
-          supabase.from("blocked_dates")
-            .select("property_id, blocked_on")
-            .order("blocked_on", { ascending: true })
-            .limit(200),
-          supabase.from("availability_blocks")
-            .select("id, property_id, check_in, check_out")
-            .order("check_in", { ascending: true })
-            .limit(200),
-          fetchAllBookings().then((data) => ({ data, error: null })).catch((error) => ({ data: null, error })),
+        const [datesResult, blocksResult, bookingResult] = await Promise.all([
+          supabase.from("blocked_dates").select("property_id, blocked_on").order("blocked_on", { ascending: true }).limit(200),
+          supabase.from("availability_blocks").select("id, property_id, check_in, check_out").order("check_in", { ascending: true }).limit(200),
+          fetchAllBookings(),
         ]);
         if (cancelled) return;
-        if (singleDatesResult.error) setError(`Could not load blocked dates: ${singleDatesResult.error.message}`);
-        if (rangeBlocksResult.error) setError((current) => current
-          ? `${current} Could not load date ranges: ${rangeBlocksResult.error.message}`
-          : `Could not load date ranges: ${rangeBlocksResult.error.message}`);
-        if (!singleDatesResult.error && !rangeBlocksResult.error) {
-          setBlockedDates([
-            ...rangeBlocksResult.data.map((block) => ({ ...block, kind: "range" })),
-            ...singleDatesResult.data.map((date) => ({ ...date, kind: "single" })),
-          ].sort((a, b) => (a.check_in || a.blocked_on).localeCompare(b.check_in || b.blocked_on)));
+        if (datesResult.error) setError(`Could not load blocked dates: ${datesResult.error.message}`);
+        else setBlockedDates(datesResult.data);
+        if (blocksResult.error) {
+          setError((current) => current
+            ? `${current} Could not load date ranges: ${blocksResult.error.message}`
+            : `Could not load date ranges: ${blocksResult.error.message}`);
+        } else {
+          setAvailabilityBlocks(blocksResult.data);
         }
         if (bookingResult.error) {
           setBookings([]);
-          setBookingsError(`Could not load bookings: ${bookingResult.error.message || "request failed"}`);
+          setBookingsError(`Could not load bookings from Supabase: ${bookingResult.error.message}`);
         } else {
-          setBookings(bookingResult.data.map(normalizeBooking));
+          setBookings(bookingResult.data);
         }
       } catch (loadError) {
         if (!cancelled) {
           setBookings([]);
-          setBookingsError(`Could not load dashboard data: ${loadError.message || "request failed"}`);
+          setBookingsError(`Could not load bookings from Supabase: ${loadError.message || "request failed"}`);
         }
       } finally {
         if (!cancelled) setLoadingData(false);
@@ -743,51 +667,6 @@ function AdminPanel() {
     loadAdminData();
     return () => { cancelled = true; };
   }, [session, dataRefresh]);
-
-  useEffect(() => {
-    if (!session || !supabase) return undefined;
-    let active = true;
-
-    async function refreshBookings() {
-      try {
-        const latestBookings = (await fetchAllBookings()).map(normalizeBooking);
-        if (active) {
-          setBookings(latestBookings);
-          setBookingsError("");
-        }
-      } catch (refreshError) {
-        if (active) {
-          console.error("Could not refresh admin bookings:", refreshError);
-          setBookingsError(`Could not refresh bookings: ${refreshError.message || "request failed"}`);
-        }
-      }
-    }
-
-    const channel = supabase
-      .channel("admin-booking-updates")
-      .on("postgres_changes", {
-        event: "INSERT",
-        schema: "public",
-        table: "bookings",
-      }, (payload) => {
-        const newBooking = normalizeBooking(payload.new);
-        setBookings((current) => current.some((booking) => booking.id === newBooking.id)
-          ? current
-          : [newBooking, ...current]);
-      })
-      .subscribe((status, channelError) => {
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          console.warn("Live booking updates unavailable; periodic refresh remains active.", channelError);
-        }
-      });
-    const refreshTimer = window.setInterval(refreshBookings, 15000);
-
-    return () => {
-      active = false;
-      window.clearInterval(refreshTimer);
-      void supabase.removeChannel(channel);
-    };
-  }, [session]);
 
   async function signIn(event) {
     event.preventDefault();
@@ -798,7 +677,7 @@ function AdminPanel() {
       return;
     }
     if (!supabase) {
-      setError("Admin sign-in is not configured. Add the Supabase project URL and public key.");
+      setError("Admin access is not configured. Add the Supabase settings from .env.example first.");
       return;
     }
     setBusy(true);
@@ -807,22 +686,53 @@ function AdminPanel() {
         email: normalizedEmail,
         password,
       });
-      if (authError) throw authError;
-      if (!ADMIN_EMAILS.includes(normalizeEmail(data.user?.email))) {
-        await supabase.auth.signOut();
-        throw new Error("This account is not authorised for admin access.");
+      if (authError) {
+        setError(authError.message === "Invalid login credentials"
+          ? "The email or password is incorrect. Check your details or reset this account’s password in Supabase."
+          : authError.message);
+      } else {
+        const authenticatedEmail = normalizeEmail(data.user?.email);
+        console.info("[admin-auth] Allowlist check", {
+          email: authenticatedEmail || "(missing)",
+          allowedEmails: ADMIN_EMAILS,
+        });
+        if (!ADMIN_EMAILS.includes(authenticatedEmail)) {
+          await supabase.auth.signOut();
+          setError("This account is not authorised for admin access.");
+        } else {
+          setSession(data.session);
+          setPassword("");
+        }
       }
-      setSession(data.session);
-      setPassword("");
     } catch (requestError) {
       console.error("Admin password sign-in failed:", requestError);
-      setError(requestError.message || "We couldn't sign you in. Please try again.");
+      setError(requestError.message?.includes("Failed to fetch")
+        ? "Could not reach Supabase. Check the project URL and your internet connection, then try again."
+        : requestError.message || "We couldn't sign you in. Please try again.");
     } finally {
       setBusy(false);
     }
   }
 
   async function addBlockedDate(event) {
+    event.preventDefault();
+    setError("");
+    const { error: saveError } = await supabase.from("blocked_dates").insert({ property_id: property, blocked_on: blockedOn });
+    if (saveError) {
+      setError(saveError.code === "23505" ? "That date is already blocked." : saveError.message);
+      return;
+    }
+    setBlockedDates((dates) => [...dates, { property_id: property, blocked_on: blockedOn }].sort((a, b) => a.blocked_on.localeCompare(b.blocked_on)));
+  }
+
+  async function removeBlockedDate(date) {
+    setError("");
+    const { error: removeError } = await supabase.from("blocked_dates").delete().eq("property_id", date.property_id).eq("blocked_on", date.blocked_on);
+   if (removeError) setError(removeError.message);
+    else setBlockedDates((dates) => dates.filter((item) => item.property_id !== date.property_id || item.blocked_on !== date.blocked_on));
+  }
+
+  async function addAvailabilityBlock(event) {
     event.preventDefault();
     setError("");
     if (blockedTo < blockedFrom) {
@@ -835,69 +745,23 @@ function AdminPanel() {
       .single();
     if (saveError) {
       setError(saveError.message);
+      return;
+    }
+    setAvailabilityBlocks((blocks) => [...blocks, data].sort((a, b) => a.check_in.localeCompare(b.check_in)));
+  }
+
+  async function removeAvailabilityBlock(block) {
+    setError("");
+    const { data, error: removeError } = await supabase.from("availability_blocks")
+      .delete()
+      .eq("id", block.id)
+      .select("id");
+    if (removeError) {
+      setError(removeError.message);
+    } else if (!data?.length) {
+      setError("The date range was not removed. Check that you are signed in as an authorised admin.");
     } else {
-      setBlockedDates((dates) => [...dates, { ...data, kind: "range" }]
-        .sort((a, b) => (a.check_in || a.blocked_on).localeCompare(b.check_in || b.blocked_on)));
-    }
-  }
-
-  async function removeBlockedDate(date) {
-    setError("");
-    const blockKey = date.kind === "range" ? `range-${date.id}` : `single-${date.property_id}-${date.blocked_on}`;
-    setRemovingBlock(blockKey);
-    try {
-      const removeQuery = date.kind === "range"
-        ? supabase.from("availability_blocks").delete().eq("id", date.id).select("id")
-        : supabase.from("blocked_dates").delete()
-          .eq("property_id", date.property_id)
-          .eq("blocked_on", date.blocked_on)
-          .select("property_id, blocked_on");
-      const { data, error: removeError } = await removeQuery;
-      if (removeError) throw removeError;
-      if (!data?.length) {
-        throw new Error("The date was not removed. Check that you are signed in as an authorised admin and that the latest Supabase schema policies are applied.");
-      }
-      setBlockedDates((dates) => dates.filter((item) => date.kind === "range"
-        ? item.kind !== "range" || item.id !== date.id
-        : item.kind !== "single" || item.property_id !== date.property_id || item.blocked_on !== date.blocked_on));
-    } catch (removeError) {
-      setError(`Could not unblock this date: ${removeError.message || "request failed"}`);
-    } finally {
-      setRemovingBlock("");
-    }
-  }
-
-  async function removeAllBlockedDates() {
-    if (!window.confirm("Unblock every date for both accommodations?")) return;
-    setError("");
-    setClearingBlocks(true);
-    try {
-      const [rangesResult, datesResult] = await Promise.all([
-        supabase.from("availability_blocks").delete().not("id", "is", null).select("id"),
-        supabase.from("blocked_dates").delete().not("blocked_on", "is", null).select("property_id, blocked_on"),
-      ]);
-      if (rangesResult.error || datesResult.error) {
-        setError([
-          rangesResult.error && `Could not remove date ranges: ${rangesResult.error.message}`,
-          datesResult.error && `Could not remove blocked dates: ${datesResult.error.message}`,
-        ].filter(Boolean).join(" "));
-        setDataRefresh((count) => count + 1);
-        return;
-      }
-      const removedRangeIds = new Set((rangesResult.data || []).map((item) => item.id));
-      const removedDates = new Set((datesResult.data || []).map((item) => `${item.property_id}-${item.blocked_on}`));
-      setBlockedDates((dates) => dates.filter((item) => item.kind === "range"
-        ? !removedRangeIds.has(item.id)
-        : !removedDates.has(`${item.property_id}-${item.blocked_on}`)));
-      if (blockedDates.length > 0 && removedRangeIds.size + removedDates.size === 0) {
-        setError("No blocked dates were removed. Check admin delete permissions and the Supabase schema policies.");
-        setDataRefresh((count) => count + 1);
-      }
-    } catch (clearError) {
-      setError(`Could not unblock all dates: ${clearError.message || "request failed"}`);
-      setDataRefresh((count) => count + 1);
-    } finally {
-      setClearingBlocks(false);
+      setAvailabilityBlocks((blocks) => blocks.filter((item) => item.id !== block.id));
     }
   }
 
@@ -914,13 +778,14 @@ function AdminPanel() {
         {!session ? <div className="admin-login">
           <div className="admin-lock"><ShieldCheck size={25} /></div>
           <span className="eyebrow">Private access</span><h2 id="admin-title">Admin sign in</h2>
-          <p>Sign in with an authorised admin email and password to manage dates and view guest bookings.</p>
+          <p>Sign in with an authorised admin email and its Supabase password to manage dates and view guest bookings.</p>
           <form onSubmit={signIn}>
             <label className="field"><span>Admin email</span><input type="email" required autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} /></label>
             <label className="field"><span>Password</span><input type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
             <button className="button button-primary full-width" disabled={busy}>{busy ? "Signing in…" : "Sign in to dashboard"} <ArrowRight size={16} /></button>
           </form>
           <div className="secure-note"><ShieldCheck size={14} /> Only the two authorised admin accounts can sign in.</div>
+          {!supabase && <p className="setup-note">Connect a Supabase project to enable secure admin access.</p>}
         </div> : <div className="admin-dashboard">
           <div className="admin-title-row"><div><span className="eyebrow">Welcome back</span><h2 id="admin-title">Stay dashboard</h2></div><button className="signout-button" onClick={signOut}>Sign out</button></div>
           <p className="admin-email"><ShieldCheck size={14} /> Signed in as {session.user.email}</p>
@@ -928,28 +793,28 @@ function AdminPanel() {
           <section className="admin-card"><div className="admin-card-title"><CalendarDays size={18} /><div><strong>Block unavailable dates</strong><small>Prevent guest requests for these dates.</small></div></div>
             <form className="block-form" onSubmit={addBlockedDate}>
               <label className="field"><span>Accommodation</span><select value={property} onChange={(event) => setProperty(event.target.value)}><option value="clandstein">CLANDSTEIN Houseboat</option><option value="coates">Coates Cottage</option></select></label>
-              <label className="field"><span>Block from</span><input required type="date" min={dateOffset(0)} value={blockedFrom} onChange={(event) => setBlockedFrom(event.target.value)} /></label>
-              <label className="field"><span>Block through</span><input required type="date" min={blockedFrom} value={blockedTo} onChange={(event) => setBlockedTo(event.target.value)} /></label>
+              <label className="field"><span>Date to block</span><input required type="date" min={dateOffset(0)} value={blockedOn} onChange={(event) => setBlockedOn(event.target.value)} /></label>
               <button className="button button-primary" type="submit"><Plus size={16} /> Block date</button>
             </form>
             <div className="admin-list">
-              <div className="admin-list-heading">
-                <h3>Blocked dates <span>{blockedDates.length}</span></h3>
-                <button className="unblock-all-button" type="button" disabled={loadingData || clearingBlocks || blockedDates.length === 0} onClick={removeAllBlockedDates}>
-                  {clearingBlocks ? "Unblocking…" : "Unblock all dates"}
-                </button>
-              </div>
-              {loadingData ? <p className="empty-state">Loading dates…</p> : blockedDates.length === 0 ? <p className="empty-state">No dates blocked yet.</p> : blockedDates.map((date) => {
-                const start = date.check_in || date.blocked_on;
-                const end = date.check_out || date.blocked_on;
-                const blockKey = date.kind === "range" ? `range-${date.id}` : `single-${date.property_id}-${date.blocked_on}`;
-                const isRemoving = removingBlock === blockKey;
-                return <div className="admin-list-row" key={blockKey}>
-                  <span><CalendarDays size={15} /> {prettyDate(start)}{end !== start && ` – ${prettyDate(end)}`}</span>
-                  <small>{properties[date.property_id]?.name || date.property_id}</small>
-                  <button className="unblock-button" type="button" disabled={isRemoving || clearingBlocks} aria-label={`Unblock ${prettyDate(start)}${end !== start ? ` through ${prettyDate(end)}` : ""}`} onClick={() => removeBlockedDate(date)}>{isRemoving ? <RefreshCw size={14} className="is-spinning" /> : <X size={14} />} {isRemoving ? "Removing…" : "Unblock"}</button>
-                </div>;
-              })}
+              <h3>Blocked dates <span>{blockedDates.length}</span></h3>
+              {loadingData ? <p className="empty-state">Loading dates…</p> : blockedDates.length === 0 ? <p className="empty-state">No dates blocked yet.</p> : blockedDates.map((date) => <div className="admin-list-row" key={`${date.property_id}-${date.blocked_on}`}><span><CalendarDays size={15} /> {prettyDate(date.blocked_on)}</span><small>{properties[date.property_id]?.name || date.property_id}</small><button className="unblock-button" aria-label={`Unblock ${prettyDate(date.blocked_on)}`} onClick={() => removeBlockedDate(date)}><X size={16} /></button></div>)}
+            </div>
+            <div className="admin-list">
+              <h3>Blocked date ranges <span>{availabilityBlocks.length}</span></h3>
+              <form className="block-form availability-block-form" onSubmit={addAvailabilityBlock}>
+                <label className="field"><span>Accommodation</span><select value={property} onChange={(event) => setProperty(event.target.value)}><option value="clandstein">CLANDSTEIN Houseboat</option><option value="coates">Coates Cottage</option></select></label>
+                <label className="field"><span>Block from</span><input required type="date" min={dateOffset(0)} value={blockedFrom} onChange={(event) => setBlockedFrom(event.target.value)} /></label>
+                <label className="field"><span>Block through</span><input required type="date" min={blockedFrom} value={blockedTo} onChange={(event) => setBlockedTo(event.target.value)} /></label>
+                <button className="button button-primary" type="submit"><Plus size={16} /> Block range</button>
+              </form>
+              {loadingData ? <p className="empty-state">Loading date ranges…</p> : availabilityBlocks.length === 0 ? <p className="empty-state">No date ranges blocked yet.</p> : availabilityBlocks.map((block) => (
+                <div className="admin-list-row" key={block.id}>
+                  <span><CalendarDays size={15} /> {prettyDate(block.check_in)} – {prettyDate(block.check_out)}</span>
+                  <small>{properties[block.property_id]?.name || block.property_id}</small>
+                  <button className="unblock-button" aria-label={`Unblock ${prettyDate(block.check_in)} through ${prettyDate(block.check_out)}`} onClick={() => removeAvailabilityBlock(block)}><X size={16} /></button>
+                </div>
+              ))}
             </div>
           </section>
           <section className="admin-card admin-bookings-card">
@@ -966,7 +831,7 @@ function AdminPanel() {
                       <td data-label="Name"><strong>{booking.name || "—"}</strong></td>
                       <td data-label="Email">{booking.email ? <a href={`mailto:${encodeURIComponent(booking.email)}?subject=${encodeURIComponent("Your Stay at UniLeisure enquiry")}`}>{booking.email}</a> : "—"}</td>
                       <td data-label="Phone">{booking.phone ? <a href={`tel:${encodeURIComponent(booking.phone)}`}>{booking.phone}</a> : "—"}</td>
-                      <td data-label="Stay">{properties[booking.property]?.name || booking.property || "—"}</td>
+                      <td data-label="Stay">{booking.houseboat_name||  "—"}</td>
                       <td data-label="Dates"><span className="booking-date-range">{prettyDate(booking.check_in)}<br /><span>to</span><br />{prettyDate(booking.check_out)}</span></td>
                       <td data-label="Guests">{booking.guests ?? "—"}</td>
                     </tr>
@@ -1024,7 +889,7 @@ function App() {
           <button className="mobile-menu-button" aria-label="Toggle navigation" onClick={() => setMenuOpen(!menuOpen)}>{menuOpen ? <X /> : <Menu />}</button>
           <nav className={menuOpen ? "nav-links is-open" : "nav-links"} aria-label="Main navigation" onClick={() => setMenuOpen(false)}>
             <a href="#kariba">Lake Kariba</a><a href="#nyanga">Nyanga</a><a href="#booking">Plan your stay</a>
-            <a className="nav-contact" href={whatsappChatLink()} target="_self"><MessageCircle size={16} /> Talk to us</a>
+            <a className="nav-contact" href={whatsappLink("Hello! I'd like to plan a stay with UniLeisure.")} target="_blank" rel="noreferrer"><MessageCircle size={16} /> Talk to us</a>
           </nav>
         </div>
       </header>
