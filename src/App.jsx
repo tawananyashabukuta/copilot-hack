@@ -132,30 +132,23 @@ function BookingForm({ initialProperty = "clandstein" }) {
     setGuests((value) => Math.min(value, properties[nextProperty].maxGuests));
   }
 
-  useEffect(() => {
-    function handlePropertyChange(event) {
-      if (Object.prototype.hasOwnProperty.call(properties, event.detail)) changeProperty(event.detail);
-    }
-    window.addEventListener("select-stay", handlePropertyChange);
-    return () => window.removeEventListener("select-stay", handlePropertyChange);
-  }, []);
+ async function fetchAllBookings() {
+  const pageSize = 500;
+  const allBookings = [];
+  let start = 0;
 
-  function validateBooking() {
-    setMessage("");
-    if (new Date(checkOut) <= new Date(checkIn)) {
-      setMessage("Please choose a check-out date after your arrival.");
-      return false;
-    }
-    const nights = Math.round((new Date(checkOut) - new Date(checkIn)) / 86400000);
-    if (nights < stay.minimumNights) {
-      setMessage(`${stay.name} has a minimum stay of ${stay.minimumNights} nights.`);
-      return false;
-    }
-    if (guests > stay.maxGuests) {
-      setMessage(`This stay accommodates up to ${stay.maxGuests} guests.`);
-      return false;
-    }
-    return true;
+  while (true) {
+    const { data, error } = await supabase
+      .from("bookings")
+      .select("id, name, email, phone, property, check_in, check_out, guests, status")
+      .order("check_in", { ascending: false })
+      .order("name", { ascending: true })
+      .order("check_out", { ascending: true })
+      .range(start, start + pageSize - 1);
+    if (error) return { data: null, error };
+    allBookings.push(...data);
+    if (data.length < pageSize) break;
+    start += pageSize;
   }
 
   async function enquireOnWhatsApp(event) {
@@ -278,8 +271,8 @@ function BookingForm({ initialProperty = "clandstein" }) {
         <label className="field"><span>Email address</span><input required type="email" autoComplete="email" maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /></label>
         <label className="field"><span>WhatsApp / phone</span><input required type="tel" autoComplete="tel" maxLength={30} value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+263 ..." /></label>
         <div className="booking-actions">
-          <button className="button button-outline booking-whatsapp-button" type="button" disabled={checkingAvailability || busy} onClick={enquireOnWhatsApp}>
-            <MessageCircle size={16} /> {checkingAvailability ? "Checking dates…" : "Enquire on WhatsApp"}
+          <button className="button button-outline booking-whatsapp-button" type="button" onClick={enquireOnWhatsApp}>
+            <MessageCircle size={16} /> Enquire on WhatsApp
           </button>
           <button className="button button-primary booking-submit" disabled={busy || checkingAvailability} type="submit">
             {busy ? "Saving…" : "Book"} <ArrowUpRight size={17} />
